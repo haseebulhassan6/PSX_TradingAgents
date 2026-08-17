@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 import pandas as pd
 
 
@@ -24,47 +23,48 @@ def enrich(df: pd.DataFrame) -> pd.DataFrame:
 
 def _recent_pivots(d: pd.DataFrame, lookback: int = 60) -> tuple[float, float]:
     w = d.tail(lookback)
-    # Exclude latest candle so resistance must exist before the attempted breakout.
     prev = w.iloc[:-1] if len(w) > 1 else w
-    resistance = float(prev["high"].max()) if "high" in prev and prev["high"].notna().any() else float(prev["close"].max())
-    support = float(prev["low"].min()) if "low" in prev and prev["low"].notna().any() else float(prev["close"].min())
+    resistance = float(prev["high"].max())
+    support = float(prev["low"].min())
     return support, resistance
 
 
 def evaluate(symbol: str, df: pd.DataFrame) -> dict:
     if len(df) < 55:
         raise ValueError("Need at least 55 daily candles")
+
     d = enrich(df)
     x = d.iloc[-1]
-    prev = d.iloc[-2]
     support, resistance = _recent_pivots(d, 60)
+
     close = float(x["close"])
-    open_ = float(x.get("open", close)) if not pd.isna(x.get("open", close)) else close
-    high = float(x.get("high", close)) if not pd.isna(x.get("high", close)) else close
-    low = float(x.get("low", close)) if not pd.isna(x.get("low", close)) else close
+    open_ = float(x["open"])
+    high = float(x["high"])
+    low = float(x["low"])
     ema20 = float(x["ema20"])
     ema50 = float(x["ema50"])
     rv = float(x["rsi14"]) if not pd.isna(x["rsi14"]) else 0.0
     vr = float(x["volume_ratio"]) if not pd.isna(x["volume_ratio"]) else 0.0
 
     breakout = close > resistance
-    body = abs(close - open_)
     candle_range = max(high - low, 1e-9)
+    body = abs(close - open_)
     upper_wick = high - max(close, open_)
-    strong_candle = close > open_ and body / candle_range >= 0.50 and upper_wick / candle_range <= 0.30
+    strong_candle = (
+        close > open_
+        and body / candle_range >= 0.50
+        and upper_wick / candle_range <= 0.30
+    )
     extended = (close - ema20) / ema20 > 0.10 if ema20 else True
 
-    # Fibonacci retracement from confirmed recent range.
-    swing_low, swing_high = support, resistance
-    span = max(swing_high - swing_low, 0.0)
-    fib38 = swing_high - 0.382 * span
-    fib50 = swing_high - 0.500 * span
-    fib62 = swing_high - 0.618 * span
-    fib127 = swing_low + 1.272 * span
-    fib162 = swing_low + 1.618 * span
+    span = max(resistance - support, 0.0)
+    fib38 = resistance - 0.382 * span
+    fib50 = resistance - 0.500 * span
+    fib62 = resistance - 0.618 * span
+    fib127 = support + 1.272 * span
+    fib162 = support + 1.618 * span
 
-    # Structure-based stop: under breakout level and latest short-term swing low.
-    recent_low = float(d.iloc[-6:-1]["low"].min()) if "low" in d.columns and d.iloc[-6:-1]["low"].notna().any() else support
+    recent_low = float(d.iloc[-6:-1]["low"].min())
     stop = min(resistance * 0.998, recent_low)
     risk = close - stop
     measured = resistance + max(resistance - recent_low, 0)
@@ -83,8 +83,25 @@ def evaluate(symbol: str, df: pd.DataFrame) -> dict:
     score += 10 if rr >= 2 else 0
     score += 5 if not extended else 0
 
-    valid = all([breakout, vr >= 1.2, close > ema20, 50 <= rv <= 80, not extended, rr >= 2])
-    signal = "BUY" if valid else ("WAIT FOR RETEST" if breakout and extended else "WAIT FOR BREAKOUT")
+    valid = all(
+        [
+            breakout,
+            vr >= 1.2,
+            close > ema20,
+            close > ema50,
+            50 <= rv <= 80,
+            strong_candle,
+            not extended,
+            rr >= 2,
+        ]
+    )
+
+    if valid:
+        signal = "BUY"
+    elif breakout and extended:
+        signal = "WAIT FOR RETEST"
+    else:
+        signal = "WAIT FOR BREAKOUT"
 
     return {
         "stock": symbol,
