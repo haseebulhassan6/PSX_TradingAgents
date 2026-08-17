@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from datetime import date, timedelta
 from io import StringIO
 import re
 
@@ -9,12 +9,6 @@ import requests
 
 BASE_URL = "https://dps.psx.com.pk"
 HEADERS = {"User-Agent": "Mozilla/5.0 PSX-TradingAgents/1.0"}
-
-
-@dataclass
-class MarketSnapshot:
-    kmi30_change_pct: float | None = None
-    kse100_change_pct: float | None = None
 
 
 def _get(url: str, timeout: int = 20) -> requests.Response:
@@ -38,7 +32,6 @@ def get_kmi30_symbols() -> list[str]:
     except ValueError:
         pass
 
-    # Fallback for minor HTML layout changes.
     candidates = re.findall(r'href=["\']/company/([A-Z0-9.-]+)["\']', html)
     candidates = list(dict.fromkeys(candidates))
     if len(candidates) >= 20:
@@ -46,65 +39,79 @@ def get_kmi30_symbols() -> list[str]:
     raise RuntimeError("Could not read KMI30 constituents from PSX DPS.")
 
 
-def get_eod(symbol: str) -> pd.DataFrame:
-    """Fetch PSX end-of-day series and normalize to date/open/high/low/close/volume.
+def _normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
+    d = df.copy()
+    if isinstance(d.index, pd.DatetimeIndex) and "date" not in [str(c).lower() for c in d.columns]:
+        d = d.reset_index()
+    d.columns = [str(c).strip().lower().replace(" ", "_") for c in d.columns]
+    aliases = {
+        "date": ("date", "datetime", "timestamp", "index"),
+        "open": ("open", "open_price"),
+        "high": ("high", "high_price"),
+        "low": ("low", "low_price"),
+        "close": ("close", "price", "current"),
+        "volume": ("volume", "vol"),
+    }
+    out: dict[str, pd.Series] = {}
+    for target, names in aliases.items():
+        source = next((n for n in names if n in d.columns), None)
+        if source is not None:
+            out[target] = d[source]
+    result = pd.DataFrame(out)
+    required = {"date", "open", "high", "low", "close", "volume"}
+    if not required.issubset(result.columns):
+        missing = sorted(required - set(result.columns))
+        raise RuntimeError(f"OHLCV data missing columns: {', '.join(missing)}")
+    result["date"] = pd.to_datetime(result["date"], errors="coerce")
+    for c in ("open", "high", "low", "close", "volume"):
+        result[c] = pd.to_numeric(result[c], errors="coerce")
+    return (
+        result.dropna(subset=["date", "open", "high", "low", "close", "volume"])
+        .sort_values("date")
+        .drop_duplicates("date")
+        .reset_index(drop=True)
+    )
 
-    PSX currently exposes /timeseries/eod/{SYMBOL}. The response format has changed
-    historically, so this parser accepts common list/dict shapes.
+
+def get_eod(symbol: str, lookback_days: int = 420) -> pd.DataFrame:
+    """Fetch daily OHLCV.
+
+    Preferred source is the open-source ``psxdata`` package, which reads public PSX
+    pages and provides full OHLCV. A direct DPS timeseries fallback is retained for
+    diagnostics, but it is rejected when high/low are unavailable because this
+    scanner will not manufacture candlestick or support/resistance data.
     """
+    try:
+        import psxdata  # type: ignore
+
+        end = date.today()
+        start = end - timedelta(days=lookback_days)
+        df = psxdata.stocks(symbol, start=start.isoformat(), end=end.isoformat())
+        normalized = _normalize_ohlcv(df)
+        if len(normalized) >= 55:
+            return normalized
+    except Exception:
+        pass
+
     payload = _get(f"{BASE_URL}/timeseries/eod/{symbol}").json()
-    rows = payload
-    if isinstance(payload, dict):
-        for key in ("data", "timeseries", "series", "rows"):
-            if isinstance(payload.get(key), list):
-                rows = payload[key]
-                break
+    rows = payload.get("data", payload) if isinstance(payload, dict) else payload
     if not isinstance(rows, list) or not rows:
         raise RuntimeError(f"No EOD data returned for {symbol}")
 
     first = rows[0]
-    if isinstance(first, dict):
-        df = pd.DataFrame(rows)
-        aliases = {
-            "date": ["date", "time", "timestamp", "datetime"],
-            "open": ["open", "o"],
-            "high": ["high", "h"],
-            "low": ["low", "l"],
-            "close": ["close", "c", "price"],
-            "volume": ["volume", "v", "vol"],
-        }
-        out = {}
-        lower = {str(c).lower(): c for c in df.columns}
-        for target, names in aliases.items():
-            source = next((lower[n] for n in names if n in lower), None)
-            if source is not None:
-                out[target] = df[source]
-        df = pd.DataFrame(out)
-    else:
-        # Common PSX compact series are timestamp + OHLCV or timestamp + close + volume.
-        width = len(first) if isinstance(first, (list, tuple)) else 0
-        if width >= 6:
-            df = pd.DataFrame(rows, columns=["date", "open", "high", "low", "close", "volume", *[f"x{i}" for i in range(width - 6)]])
-            df = df[["date", "open", "high", "low", "close", "volume"]]
-        elif width == 3:
-            df = pd.DataFrame(rows, columns=["date", "close", "volume"])
-            df["open"] = df["close"]
-            df["high"] = df["close"]
-            df["low"] = df["close"]
-        else:
-            raise RuntimeError(f"Unsupported PSX EOD response shape for {symbol}")
+    if not isinstance(first, (list, tuple)):
+        raise RuntimeError(f"Unsupported PSX EOD response for {symbol}")
 
-    required = {"date", "close", "volume"}
-    if not required.issubset(df.columns):
-        raise RuntimeError(f"PSX EOD response for {symbol} is missing required fields")
+    # DPS /timeseries/eod commonly returns timestamp, close, volume, open only.
+    # That is insufficient for high-precision candlestick/support analysis.
+    if len(first) < 6:
+        raise RuntimeError(
+            "Direct PSX EOD feed does not include full OHLCV. Install psxdata and retry."
+        )
 
-    for c in ("open", "high", "low", "close", "volume"):
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-    # Numeric epoch values are normally seconds; pandas also handles normal date strings.
-    if pd.api.types.is_numeric_dtype(df["date"]):
-        df["date"] = pd.to_datetime(df["date"], unit="s", errors="coerce")
-    else:
-        df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    df = df.dropna(subset=["date", "close"]).sort_values("date").drop_duplicates("date")
-    return df.reset_index(drop=True)
+    width = len(first)
+    df = pd.DataFrame(
+        rows,
+        columns=["date", "open", "high", "low", "close", "volume", *[f"x{i}" for i in range(width - 6)]],
+    )
+    return _normalize_ohlcv(df[["date", "open", "high", "low", "close", "volume"]])
